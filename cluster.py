@@ -66,6 +66,10 @@ class TestCluster:
     def start(self) -> str:
         logger.info("Starting test cluster...")
         self._cluster.start(wait_for_binary_proto=True)
+        # Write CURRENT file so the ccm CLI (used by ccm-tagged Go tests) can
+        # locate this matrix-managed cluster via CCM_CONFIG_DIR.
+        current_file = self.cluster_directory / "CURRENT"
+        current_file.write_text("test")
         nodes_count = len(self._cluster.nodes)
         logger.info("test cluster started")
         path = "../gocql-scylla/ccm/test/node1/cql.m"

@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import shutil
 import subprocess
 import json
 from functools import cached_property
@@ -87,11 +88,59 @@ class Run:
         return file_path
 
     @cached_property
+    def _ccm_bin_dir(self) -> str:
+        """Ensure the ccm CLI binary is available in a well-known directory.
+
+        pip may install ccm to a user-local directory (e.g. /jenkins/.local/bin)
+        that is not on PATH inside Docker containers. We locate the binary and
+        copy it to /tmp/ccm-bin/ so it can be added to PATH reliably.
+        """
+        target_dir = "/tmp/ccm-bin"
+        target_bin = os.path.join(target_dir, "ccm")
+
+        if os.path.isfile(target_bin) and os.access(target_bin, os.X_OK):
+            return target_dir
+
+        # Try standard locations where pip might install ccm
+        home = os.environ.get("HOME", os.path.expanduser("~"))
+        candidates = [
+            shutil.which("ccm"),                                  # already on PATH
+            os.path.join(home, ".local", "bin", "ccm"),           # user install
+            "/usr/local/bin/ccm",                                 # system install
+        ]
+
+        ccm_src = None
+        for c in candidates:
+            if c and os.path.isfile(c) and os.access(c, os.X_OK):
+                ccm_src = c
+                break
+
+        if ccm_src:
+            os.makedirs(target_dir, exist_ok=True)
+            shutil.copy2(ccm_src, target_bin)
+            os.chmod(target_bin, 0o755)
+            logging.info("Copied ccm binary from '%s' to '%s'", ccm_src, target_bin)
+        else:
+            logging.warning("ccm binary not found in any expected location: %s", candidates)
+            os.makedirs(target_dir, exist_ok=True)
+
+        return target_dir
+
+    @cached_property
     def environment(self) -> Dict:
         result = {}
         result.update(os.environ)
         result["PROTOCOL_VERSION"] = str(self._protocol)
         result["SCYLLA_VERSION"] = self._scylla_version
+        # Add directory containing ccm binary to PATH
+        existing_path = result.get("PATH", "")
+        if self._ccm_bin_dir not in existing_path.split(os.pathsep):
+            existing_path = self._ccm_bin_dir + os.pathsep + existing_path
+        result["PATH"] = existing_path
+        logging.info("Go test subprocess PATH: %s", result["PATH"])
+        # Point the ccm CLI at the cluster directory used by ccmlib so that
+        # CLI commands operate on the same cluster the matrix started.
+        result["CCM_CONFIG_DIR"] = str(self._gocql_driver_git / "ccm")
         return result
 
     def _run_command_in_shell(self, cmd: str):
@@ -167,7 +216,7 @@ class Run:
                     args = f"-gocql.timeout=60s -proto={self._protocol} -autowait=2000ms -compressor=snappy -gocql.cversion={cversion}"
                     if self._driver_type == 'scylla' and Version(self._full_driver_version.lstrip('v')) >= Version('1.16.1'):
                         args += " -distribution=scylla"
-                    go_test_cmd = f'go test -v {test_config.test_command_args} {cluster_params} {skip_tests} {args} ./...  2>&1 | go-junit-report -iocopy -out {self.xunit_file}_part_{idx}'
+                    go_test_cmd = f'export PATH="{self._ccm_bin_dir}:$PATH" && export CCM_CONFIG_DIR="{self._gocql_driver_git / "ccm"}" && echo "DEBUG: PATH=$PATH" && echo "DEBUG: which ccm=$(which ccm 2>&1)" && echo "DEBUG: ls ccm-bin=$(ls -la /tmp/ccm-bin/ 2>&1)" && go test -v {test_config.test_command_args} {cluster_params} {skip_tests} {args} ./...  2>&1 | go-junit-report -iocopy -out {self.xunit_file}_part_{idx}'
                     logging.info("Running the command '%s'", go_test_cmd)
                     subprocess.call(f"{go_test_cmd}", shell=True, executable="/bin/bash",
                                     env=self.environment, cwd=self._gocql_driver_git)
@@ -175,12 +224,12 @@ class Run:
                                       gocql_driver_type=self._driver_type, driver_module=driver_module)
             metadata_file.write_text(json.dumps(metadata))
         return junit
-   
-    
+
+
     def _get_driver_module(self):
         """
         Extract the module name from the go.mod file in the gocql driver repository.
-        
+
         :return: The module name as a string.
         """
         DEFAULT_GOCQL_MODULE = "github.com/gocql/gocql"
